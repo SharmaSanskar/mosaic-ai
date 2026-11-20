@@ -27,18 +27,20 @@ export function CreateRoomDialog() {
     e.preventDefault();
     setLoading(true);
 
-    const { error } = await supabase.from("rooms").insert({ name });
+    const { data, error } = await supabase.rpc("create_room", { p_name: name });
 
     setLoading(false);
 
-    if (error) {
-      toast.error(error.message);
+    const room = Array.isArray(data) ? data[0] : data;
+    if (error || !room) {
+      toast.error(error?.message ?? "Could not create room");
       return;
     }
 
     setName("");
     setOpen(false);
-    router.refresh();
+    toast.success(`Room created · share code ${room.join_code}`);
+    router.push(`/room/${room.id}`);
   }
 
   return (

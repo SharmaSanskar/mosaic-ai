@@ -59,10 +59,19 @@ func (c *Client) readPump() {
 			return
 		}
 
-		if !c.limiter.Allow() {
-			slog.Warn("rate limit exceeded", "user", c.userID, "remote", c.remote)
-			c.sendRateLimitWarning()
-			continue
+		// Rate-limit only chat ingestion (the spammy path). Control frames
+		// (typing, viz-repair, agent changes) are cheap and must not eat a
+		// user's chat allowance, so they bypass the limiter.
+		var env struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(data, &env)
+		if env.Type == EventChat {
+			if !c.limiter.Allow() {
+				slog.Warn("rate limit exceeded", "user", c.userID, "remote", c.remote)
+				c.sendRateLimitWarning()
+				continue
+			}
 		}
 
 		c.room.broadcast <- clientMessage{client: c, data: data}
@@ -76,7 +85,7 @@ func (c *Client) sendRateLimitWarning() {
 	if err != nil {
 		return
 	}
-	out, err := json.Marshal(WSEvent{Type: "SYSTEM", Payload: payload})
+	out, err := json.Marshal(WSEvent{Type: EventSystem, Payload: payload})
 	if err != nil {
 		return
 	}

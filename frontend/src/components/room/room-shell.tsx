@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { ArrowLeft, MessageSquare, Network, Pin } from "lucide-react";
 import {
@@ -16,8 +16,13 @@ import {
 import { RoomSocketProvider } from "@/lib/room-socket-context";
 import { RoomStatus } from "@/components/room/room-status";
 import { ChatPane } from "@/components/room/chat-pane";
-import { GraphPane } from "@/components/room/graph-pane";
+import { RoomTitle } from "@/components/room/room-title";
+import { VizPane } from "@/components/room/viz-pane";
 import { ArtifactsPane } from "@/components/room/artifacts-pane";
+import { AgentsDialog } from "@/components/room/agents-dialog";
+import { PresenceBar } from "@/components/room/presence-bar";
+import { ThemeToggle } from "@/components/theme-toggle";
+import { BrandMark } from "@/components/brand";
 import { Button } from "@/components/ui/button";
 import type { Room } from "@/lib/types";
 
@@ -47,6 +52,20 @@ export function RoomShell({ room }: RoomShellProps) {
   const graphRef = usePanelRef();
   const artifactsRef = usePanelRef();
 
+  // The saved layout lives in localStorage, which is unavailable during SSR. To
+  // avoid a hydration mismatch on the panels' inline sizes, the server and the
+  // first client render both use the default layout (identical markup); once
+  // hydrated, `mounted` becomes true, which both applies the stored
+  // `defaultLayout` and changes the group's key so it remounts at those sizes.
+  // useSyncExternalStore is the hydration-safe way to read "are we on the client
+  // yet" without a setState-in-effect: it returns the server snapshot (false)
+  // during SSR and the hydration render, then the client snapshot (true).
+  const mounted = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  );
+
   const [chatCollapsed, setChatCollapsed] = useState(false);
   const [graphCollapsed, setGraphCollapsed] = useState(false);
   const [artifactsCollapsed, setArtifactsCollapsed] = useState(false);
@@ -61,16 +80,20 @@ export function RoomShell({ room }: RoomShellProps) {
   return (
     <RoomSocketProvider roomId={room.id}>
       <div className="flex h-screen flex-col bg-background">
-        <header className="flex items-center gap-3 border-b bg-card px-4 py-2.5">
+        <header className="flex items-center gap-3 border-b border-border/70 bg-card px-4 py-2.5">
           <Link
             href="/dashboard"
-            className="flex items-center gap-1 text-sm text-muted-foreground transition-colors hover:text-foreground"
+            className="flex items-center gap-2 text-sm text-muted-foreground transition-colors hover:text-foreground"
+            title="Back to dashboard"
           >
             <ArrowLeft className="size-4" />
+            <BrandMark className="size-4 text-foreground" />
           </Link>
-          <h1 className="text-sm font-semibold tracking-tight">{room.name}</h1>
+          <div className="h-5 w-px bg-border" />
+          <RoomTitle roomId={room.id} initialName={room.name} joinCode={room.join_code} />
 
-          <div className="ml-2 flex items-center gap-1">
+
+          <div className="ml-2 flex items-center gap-1 rounded-lg bg-muted/50 p-0.5">
             <Button
               type="button"
               variant={chatCollapsed ? "outline" : "secondary"}
@@ -85,7 +108,7 @@ export function RoomShell({ room }: RoomShellProps) {
               variant={graphCollapsed ? "outline" : "secondary"}
               size="icon-sm"
               onClick={() => toggle(graphRef)}
-              title="Toggle reasoning graph"
+              title="Toggle visualization"
             >
               <Network />
             </Button>
@@ -100,12 +123,20 @@ export function RoomShell({ room }: RoomShellProps) {
             </Button>
           </div>
 
-          <RoomStatus initialTokens={room.total_tokens_used} />
+          <div className="ml-auto flex items-center gap-2.5">
+            <PresenceBar />
+            <RoomStatus initialTokens={room.total_tokens_used} />
+            <div className="flex items-center gap-1 border-l border-border pl-2">
+              <AgentsDialog roomId={room.id} />
+              <ThemeToggle />
+            </div>
+          </div>
         </header>
 
         <ResizablePanelGroup
+          key={mounted ? "ready" : "ssr"}
           orientation="horizontal"
-          defaultLayout={defaultLayout}
+          defaultLayout={mounted ? defaultLayout : undefined}
           onLayoutChanged={onLayoutChanged}
           className="min-h-0 flex-1"
         >
@@ -130,7 +161,7 @@ export function RoomShell({ room }: RoomShellProps) {
             collapsedSize={0}
             onResize={() => setGraphCollapsed(graphRef.current?.isCollapsed() ?? false)}
           >
-            <GraphPane roomId={room.id} />
+            <VizPane roomId={room.id} />
           </ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel

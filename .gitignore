@@ -25,3 +25,7 @@ supabase/.temp/
 
 # Claude Code local session/permission state
 .claude/
+
+# taste-skill design tooling (local only: screenshots, headless Chrome profile, reports)
+.taste-skill/
+frontend/shots/

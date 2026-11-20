@@ -1,9 +1,13 @@
 import Link from "next/link";
-import { Sparkles, Users } from "lucide-react";
+import { Users } from "lucide-react";
 import { createClient } from "@/lib/supabase/server";
 import { CreateRoomDialog } from "@/components/dashboard/create-room-dialog";
+import { JoinRoomDialog } from "@/components/dashboard/join-room-dialog";
+import { RoomCard } from "@/components/dashboard/room-card";
+import { ApiKeysDialog } from "@/components/settings/api-keys-dialog";
 import { LogoutButton } from "@/components/dashboard/logout-button";
-import { Card, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { ThemeToggle } from "@/components/theme-toggle";
+import { Wordmark } from "@/components/brand";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { avatarColorFor, initialsFor } from "@/lib/utils";
 import type { Room } from "@/lib/types";
@@ -24,60 +28,74 @@ export default async function DashboardPage() {
   const email = user?.email ?? "";
 
   return (
-    <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-8 p-6 sm:p-8">
-      <header className="flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-2.5">
-          <span className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <Sparkles className="size-4" />
-          </span>
-          <h1 className="font-mono text-lg font-semibold tracking-tight">mosaic</h1>
-        </div>
-        <div className="flex items-center gap-3">
-          <CreateRoomDialog />
+    <div className="flex min-h-full flex-col">
+      <header className="sticky top-0 z-40 border-b border-border/60 bg-background/80 backdrop-blur-md">
+        <div className="mx-auto flex h-14 w-full max-w-5xl items-center justify-between px-5">
+          <Link href="/">
+            <Wordmark />
+          </Link>
           <div className="flex items-center gap-2">
-            <Avatar size="sm">
-              <AvatarFallback className="text-white" style={{ backgroundColor: avatarColorFor(user?.id ?? email) }}>
-                {initialsFor(email)}
-              </AvatarFallback>
-            </Avatar>
-            <span className="hidden text-sm text-muted-foreground sm:inline">{email}</span>
+            <ThemeToggle />
+            <ApiKeysDialog />
+            <div className="ml-1 flex items-center gap-2 border-l border-border pl-3">
+              <Avatar size="sm">
+                <AvatarFallback
+                  className="text-xs text-white"
+                  style={{ backgroundColor: avatarColorFor(user?.id ?? email) }}
+                >
+                  {initialsFor(email)}
+                </AvatarFallback>
+              </Avatar>
+              <span className="hidden max-w-[12rem] truncate text-sm text-muted-foreground sm:inline">
+                {email}
+              </span>
+              <LogoutButton />
+            </div>
           </div>
-          <LogoutButton />
         </div>
       </header>
 
-      <div>
-        <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-muted-foreground">
-          Your rooms
-        </h2>
-        {!rooms || rooms.length === 0 ? (
-          <div className="flex flex-col items-center gap-3 rounded-xl border border-dashed py-16 text-center">
-            <Users className="size-8 text-muted-foreground" />
-            <p className="text-sm text-muted-foreground">
-              No rooms yet — create one to get started.
+      <main className="mx-auto w-full max-w-5xl flex-1 px-5 py-10">
+        <div className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight">Your rooms</h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Shared spaces where your team and your agents think together.
             </p>
           </div>
-        ) : (
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {rooms.map((room) => (
-              <Link key={room.id} href={`/room/${room.id}`}>
-                <Card className="h-full transition-colors hover:border-primary/40 hover:bg-muted/40">
-                  <CardHeader>
-                    <CardTitle className="truncate">{room.name}</CardTitle>
-                    <CardDescription className="font-mono text-xs">
-                      {new Date(room.created_at).toLocaleDateString(undefined, {
-                        month: "short",
-                        day: "numeric",
-                        year: "numeric",
-                      })}
-                    </CardDescription>
-                  </CardHeader>
-                </Card>
-              </Link>
-            ))}
+          <div className="flex items-center gap-2">
+            <JoinRoomDialog />
+            <CreateRoomDialog />
           </div>
-        )}
-      </div>
+        </div>
+
+        <div className="mt-8">
+          {!rooms || rooms.length === 0 ? (
+            <div className="flex flex-col items-center gap-4 rounded-2xl border border-dashed border-border bg-card/40 py-20 text-center">
+              <span className="flex size-12 items-center justify-center rounded-2xl bg-primary/10 text-primary ring-1 ring-primary/20">
+                <Users className="size-6" />
+              </span>
+              <div>
+                <p className="font-medium">No rooms yet</p>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  Create your first room, or join one with a share code.
+                </p>
+              </div>
+              <CreateRoomDialog />
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {rooms.map((room) => (
+                <RoomCard
+                  key={room.id}
+                  room={room}
+                  isOwner={!!user && room.created_by === user.id}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </main>
     </div>
   );
 }

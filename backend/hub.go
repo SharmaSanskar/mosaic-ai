@@ -22,12 +22,24 @@ type SystemPayload struct {
 
 type AIChunkPayload struct {
 	GenerationID string `json:"generation_id"`
+	AgentID      string `json:"agent_id"`
+	AgentName    string `json:"agent_name"`
+	AgentColor   string `json:"agent_color,omitempty"`
 	Chunk        string `json:"chunk"`
 	Done         bool   `json:"done"`
 }
 
 type StatsPayload struct {
 	TotalTokensUsed int64 `json:"total_tokens_used"`
+}
+
+type PresencePayload struct {
+	Users []string `json:"users"`
+}
+
+type TypingPayload struct {
+	UserID   string `json:"user_id"`
+	IsTyping bool   `json:"is_typing"`
 }
 
 // clientMessage is a raw frame received from a client, awaiting processing
@@ -72,6 +84,7 @@ func (h *Hub) GetOrCreateRoom(roomID string) *Room {
 		unregister: make(chan *Client),
 		sb:         h.sb,
 		cfg:        h.cfg,
+		aiBusy:     make(map[string]bool),
 	}
 	h.rooms[roomID] = room
 	go room.run()
@@ -92,7 +105,12 @@ type Room struct {
 	unregister chan *Client
 	sb         *SupabaseClient
 	cfg        Config
-	aiBusy     sync.Mutex
+
+	// aiBusy serializes generation per agent (not per room), so distinct agents
+	// can reply concurrently while a single agent can't be double-triggered.
+	// Guarded by aiMu.
+	aiMu   sync.Mutex
+	aiBusy map[string]bool
 }
 
 func (r *Room) run() {
@@ -101,12 +119,14 @@ func (r *Room) run() {
 		case c := <-r.register:
 			r.clients[c] = true
 			slog.Info("client joined room", "room", r.id, "user", c.userID)
+			r.broadcastPresence()
 
 		case c := <-r.unregister:
 			if _, ok := r.clients[c]; ok {
 				delete(r.clients, c)
 				close(c.send)
 				slog.Info("client left room", "room", r.id, "user", c.userID)
+				r.broadcastPresence()
 			}
 
 		case msg := <-r.broadcast:
@@ -126,12 +146,30 @@ func (r *Room) handleIncoming(msg clientMessage) {
 	}
 
 	switch evt.Type {
-	case "CHAT":
+	case EventChat:
 		r.handleChat(msg.client, evt.Payload)
-	case "PIN_ARTIFACT":
+	case EventPinArtifact:
 		r.handlePinArtifact(evt.Payload)
-	case "UNPIN_ARTIFACT":
+	case EventPinIdea:
+		r.handlePinIdea(evt.Payload)
+	case EventPinDiagram:
+		r.handlePinDiagram(evt.Payload)
+	case EventAddNote:
+		r.handleAddNote(msg.client, evt.Payload)
+	case EventReorderArtifact:
+		r.handleReorderArtifacts(evt.Payload)
+	case EventUnpinArtifact:
 		r.handleUnpinArtifact(evt.Payload)
+	case EventVizRepair:
+		r.handleVizRepair(evt.Payload)
+	case EventTyping:
+		r.handleTyping(msg.client, evt.Payload)
+	case EventAgentsChanged:
+		// A client changed this room's agents (via Supabase); fan out a nudge so
+		// everyone re-fetches. No payload is needed.
+		if out, err := json.Marshal(WSEvent{Type: EventAgentsUpdate, Payload: json.RawMessage(`{}`)}); err == nil {
+			r.broadcastAll(out)
+		}
 	default:
 		slog.Warn("unhandled ws event type", "room", r.id, "type", evt.Type)
 	}
@@ -170,6 +208,167 @@ func (r *Room) handlePinArtifact(payload json.RawMessage) {
 	r.persistAndBroadcastArtifacts(artifacts)
 }
 
+// handlePinIdea turns a chat message into an AI-distilled idea card. The distill
+// is a (slow) model call, so it runs on its own goroutine and broadcasts via
+// r.outgoing (persistAndBroadcastArtifacts now routes through the channel). The
+// source message id becomes the card id, so re-saving the same message is a no-op.
+func (r *Room) handlePinIdea(payload json.RawMessage) {
+	var in struct {
+		MessageID string `json:"message_id"`
+		Content   string `json:"content"`
+		Author    string `json:"author"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil || in.MessageID == "" || strings.TrimSpace(in.Content) == "" {
+		slog.Warn("dropping malformed PIN_IDEA payload", "room", r.id)
+		return
+	}
+	if r.cfg.OpenAIKey == "" {
+		r.sendSystem("Can't distill ideas — no OpenAI key configured.")
+		return
+	}
+	go r.runPinIdea(in.MessageID, in.Content, in.Author)
+}
+
+func (r *Room) runPinIdea(messageID, content, author string) {
+	card, tokens, err := distillIdea(context.Background(), r.cfg.OpenAIKey, content)
+	r.reportTokenUsage(tokens) // tokens were spent regardless of outcome
+	if err != nil {
+		slog.Warn("idea distill failed", "room", r.id, "error", err)
+		r.sendSystem("Couldn't save that as an idea — please try again.")
+		return
+	}
+
+	artifacts, err := r.sb.GetRoomArtifacts(r.id)
+	if err != nil {
+		slog.Error("failed to load artifacts", "room", r.id, "error", err)
+		return
+	}
+	for _, a := range artifacts {
+		if a.ID == messageID {
+			return // this message is already saved as an idea
+		}
+	}
+
+	artifacts = append(artifacts, Artifact{
+		ID:        messageID,
+		Kind:      "idea",
+		Title:     card.Title,
+		Content:   card.Summary,
+		Source:    content, // keep the original message for the card's detail view
+		Author:    author,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	r.persistAndBroadcastArtifacts(artifacts)
+}
+
+// handlePinDiagram snapshots the current visualization as a diagram card. No model
+// call — it freezes Mermaid source the client already rendered — so it runs inline
+// on the run() loop.
+func (r *Room) handlePinDiagram(payload json.RawMessage) {
+	var in struct {
+		Title       string `json:"title"`
+		DiagramType string `json:"diagram_type"`
+		Mermaid     string `json:"mermaid"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil || strings.TrimSpace(in.Mermaid) == "" {
+		slog.Warn("dropping malformed PIN_DIAGRAM payload", "room", r.id)
+		return
+	}
+
+	artifacts, err := r.sb.GetRoomArtifacts(r.id)
+	if err != nil {
+		slog.Error("failed to load artifacts", "room", r.id, "error", err)
+		return
+	}
+
+	title := strings.TrimSpace(in.Title)
+	if title == "" {
+		title = "Saved diagram"
+	}
+	artifacts = append(artifacts, Artifact{
+		ID:          randomID(),
+		Kind:        "diagram",
+		Title:       title,
+		Mermaid:     in.Mermaid,
+		DiagramType: in.DiagramType,
+		Author:      "AI",
+		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+	})
+	r.persistAndBroadcastArtifacts(artifacts)
+}
+
+// handleAddNote adds a free-text note card authored by the human who typed it. No
+// model call, so it runs inline on the run() loop.
+func (r *Room) handleAddNote(from *Client, payload json.RawMessage) {
+	var in struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		slog.Warn("dropping malformed ADD_NOTE payload", "room", r.id)
+		return
+	}
+	content := strings.TrimSpace(in.Content)
+	if content == "" {
+		return
+	}
+
+	artifacts, err := r.sb.GetRoomArtifacts(r.id)
+	if err != nil {
+		slog.Error("failed to load artifacts", "room", r.id, "error", err)
+		return
+	}
+
+	artifacts = append(artifacts, Artifact{
+		ID:        randomID(),
+		Kind:      "note",
+		Content:   content,
+		Author:    from.userID,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	r.persistAndBroadcastArtifacts(artifacts)
+}
+
+// handleReorderArtifacts reorders the moodboard to match the given id order. Any
+// ids not present are ignored, and any current artifacts missing from the list are
+// appended (so a concurrent add isn't dropped). No model call — runs inline.
+func (r *Room) handleReorderArtifacts(payload json.RawMessage) {
+	var in struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		slog.Warn("dropping malformed REORDER_ARTIFACTS payload", "room", r.id)
+		return
+	}
+
+	artifacts, err := r.sb.GetRoomArtifacts(r.id)
+	if err != nil {
+		slog.Error("failed to load artifacts", "room", r.id, "error", err)
+		return
+	}
+
+	byID := make(map[string]Artifact, len(artifacts))
+	for _, a := range artifacts {
+		byID[a.ID] = a
+	}
+
+	ordered := make([]Artifact, 0, len(artifacts))
+	placed := make(map[string]bool, len(artifacts))
+	for _, id := range in.IDs {
+		if a, ok := byID[id]; ok && !placed[id] {
+			ordered = append(ordered, a)
+			placed[id] = true
+		}
+	}
+	// Preserve any artifacts the client didn't know about (e.g. a concurrent add).
+	for _, a := range artifacts {
+		if !placed[a.ID] {
+			ordered = append(ordered, a)
+		}
+	}
+
+	r.persistAndBroadcastArtifacts(ordered)
+}
+
 func (r *Room) handleUnpinArtifact(payload json.RawMessage) {
 	var in struct {
 		ID string `json:"id"`
@@ -205,11 +404,14 @@ func (r *Room) persistAndBroadcastArtifacts(artifacts []Artifact) {
 	if err != nil {
 		return
 	}
-	out, err := json.Marshal(WSEvent{Type: "ARTIFACT_UPDATE", Payload: payload})
+	out, err := json.Marshal(WSEvent{Type: EventArtifactUpdate, Payload: payload})
 	if err != nil {
 		return
 	}
-	r.broadcastAll(out)
+	// Sent via r.outgoing (not broadcastAll) so this is safe to call from a
+	// goroutine (handlePinIdea) as well as from the run() loop — same pattern as
+	// persistAndBroadcastViz.
+	r.outgoing <- out
 }
 
 func (r *Room) handleChat(from *Client, payload json.RawMessage) {
@@ -236,7 +438,7 @@ func (r *Room) handleChat(from *Client, payload json.RawMessage) {
 		slog.Error("failed to marshal chat payload", "error", err)
 		return
 	}
-	out, err := json.Marshal(WSEvent{Type: "CHAT", Payload: payloadBytes})
+	out, err := json.Marshal(WSEvent{Type: EventChat, Payload: payloadBytes})
 	if err != nil {
 		slog.Error("failed to marshal ws event", "error", err)
 		return
@@ -244,85 +446,179 @@ func (r *Room) handleChat(from *Client, payload json.RawMessage) {
 
 	r.broadcastAll(out)
 
-	if strings.Contains(strings.ToLower(content), "@ai") {
-		go r.triggerAI()
+	if strings.Contains(content, "@") {
+		go r.handleMentions(content)
 	}
 }
 
-// triggerAI runs on its own goroutine (not the room's run() loop, since the
-// OpenAI call is slow) and must only touch client state via r.outgoing.
-func (r *Room) triggerAI() {
-	if !r.aiBusy.TryLock() {
-		r.sendSystem("AI is already thinking… try again in a moment.")
+// handleMentions resolves the @handles in a message to agents available in the
+// room and triggers each matched agent on its own goroutine, so several agents
+// can reply to the same message concurrently. "@ai" is a backward-compatible
+// alias for the room's default agent.
+func (r *Room) handleMentions(content string) {
+	handles := parseMentions(content)
+	if len(handles) == 0 {
 		return
 	}
-	defer r.aiBusy.Unlock()
 
-	if r.cfg.OpenAIKey == "" {
-		r.sendSystem("AI is not configured (missing OPENAI_API_KEY).")
+	agents, err := r.sb.GetRoomAgents(r.id)
+	if err != nil {
+		slog.Error("failed to load room agents", "room", r.id, "error", err)
+		return
+	}
+	if len(agents) == 0 {
+		return
+	}
+
+	byHandle := make(map[string]Agent, len(agents))
+	defaultAgent := agents[0]
+	for _, a := range agents {
+		byHandle[strings.ToLower(a.Handle)] = a
+		if strings.EqualFold(a.Handle, "assistant") {
+			defaultAgent = a
+		}
+	}
+
+	triggered := make(map[string]bool, len(handles))
+	for _, h := range handles {
+		agent, ok := byHandle[h]
+		if h == "ai" { // backward-compatible alias for the default agent
+			agent, ok = defaultAgent, true
+		}
+		if !ok || triggered[agent.ID] {
+			continue
+		}
+		triggered[agent.ID] = true
+		go r.triggerAgent(agent)
+	}
+}
+
+// triggerAgent runs one agent's reply on its own goroutine (not the room's run()
+// loop, since the model call is slow) and must only touch client state via
+// r.outgoing. Generation is serialized per agent via r.aiBusy.
+func (r *Room) triggerAgent(agent Agent) {
+	r.aiMu.Lock()
+	if r.aiBusy[agent.ID] {
+		r.aiMu.Unlock()
+		r.sendSystem(agent.Name + " is already thinking… try again in a moment.")
+		return
+	}
+	r.aiBusy[agent.ID] = true
+	r.aiMu.Unlock()
+	defer func() {
+		r.aiMu.Lock()
+		delete(r.aiBusy, agent.ID)
+		r.aiMu.Unlock()
+	}()
+
+	provider, err := providerFor(agent, r.cfg, r.sb)
+	if err != nil {
+		r.sendSystem(agent.Name + " is unavailable: " + err.Error())
 		return
 	}
 
 	history, err := r.sb.ListRecentMessages(r.id, 20)
 	if err != nil {
-		slog.Error("failed to load history for AI", "room", r.id, "error", err)
-		r.sendSystem("Couldn't load conversation history for the AI.")
+		slog.Error("failed to load history for agent", "room", r.id, "agent", agent.Handle, "error", err)
+		r.sendSystem("Couldn't load conversation history for " + agent.Name + ".")
 		return
+	}
+
+	systemPrompt := agent.SystemPrompt
+	if systemPrompt == "" {
+		systemPrompt = defaultAgentSystemPrompt
 	}
 
 	generationID := randomID()
 	var full strings.Builder
 
-	tokens, err := streamAIResponse(context.Background(), r.cfg.OpenAIKey, history, func(delta string) {
+	tokens, err := provider.StreamChat(context.Background(), ChatRequest{
+		Model:        agent.Model,
+		SystemPrompt: systemPrompt,
+		History:      history,
+		MaxTokens:    300,
+	}, func(delta string) {
 		full.WriteString(delta)
-		r.sendAIChunk(generationID, delta, false)
+		r.sendAIChunk(generationID, agent, delta, false)
 	})
 
-	r.sendAIChunk(generationID, "", true)
+	r.sendAIChunk(generationID, agent, "", true)
 	r.reportTokenUsage(tokens) // record usage regardless of outcome below — tokens were spent either way
 
 	if err != nil {
-		slog.Error("openai stream failed", "room", r.id, "error", err)
-		r.sendSystem("AI response failed: " + err.Error())
+		slog.Error("agent stream failed", "room", r.id, "agent", agent.Handle, "error", err)
+		r.sendSystem(agent.Name + " couldn't respond: " + err.Error())
 		return
 	}
 	if full.Len() == 0 {
 		return
 	}
 
-	if _, err := r.sb.InsertMessage(r.id, "AI", full.String()); err != nil {
-		slog.Error("failed to persist AI message", "room", r.id, "error", err)
+	if _, err := r.sb.InsertMessage(r.id, agentAuthorID(agent), full.String()); err != nil {
+		slog.Error("failed to persist agent message", "room", r.id, "agent", agent.Handle, "error", err)
 		return
 	}
 
-	// Fire-and-forget: the reasoning graph is a nice-to-have derived view,
-	// not on the critical path for chat, so it gets its own goroutine and
-	// doesn't hold aiBusy (a slow/failed graph call shouldn't block the next
-	// @AI mention).
-	fullHistory := append(history, Message{UserID: "AI", Content: full.String()})
-	go r.updateGraph(fullHistory)
+	// Fire-and-forget: the visualization is a nice-to-have derived view, not
+	// on the critical path for chat, so it gets its own goroutine and doesn't
+	// hold aiBusy (a slow/failed viz call shouldn't block the next mention).
+	fullHistory := append(history, Message{UserID: agentAuthorID(agent), Content: full.String()})
+	go r.updateViz(fullHistory)
 }
 
-// updateGraph runs on its own goroutine and must only touch client state via
-// r.outgoing, same constraint as triggerAI.
-func (r *Room) updateGraph(history []Message) {
-	graph, tokens, err := generateGraph(context.Background(), r.cfg.OpenAIKey, history)
+// updateViz runs on its own goroutine and must only touch client state via
+// r.outgoing, same constraint as triggerAgent. It asks the model to represent the
+// conversation as whichever Mermaid diagram best fits it.
+func (r *Room) updateViz(history []Message) {
+	viz, tokens, err := generateViz(context.Background(), r.cfg.OpenAIKey, history)
 	r.reportTokenUsage(tokens) // record usage regardless of outcome below — tokens were spent either way
 	if err != nil {
-		slog.Warn("discarding malformed graph response", "room", r.id, "error", err)
+		slog.Warn("discarding malformed viz response", "room", r.id, "error", err)
+		return
+	}
+	r.persistAndBroadcastViz(viz)
+}
+
+// handleVizRepair is invoked from the room's run() loop when a client reports
+// that the current Mermaid source failed to parse in the browser. The OpenAI
+// call is slow, so the actual work is offloaded to its own goroutine (which
+// must only touch client state via r.outgoing).
+func (r *Room) handleVizRepair(payload json.RawMessage) {
+	var in struct {
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil || strings.TrimSpace(in.Code) == "" {
+		slog.Warn("dropping malformed VIZ_REPAIR payload", "room", r.id)
+		return
+	}
+	if r.cfg.OpenAIKey == "" {
+		return
+	}
+	go r.runVizRepair(in.Code, in.Error)
+}
+
+func (r *Room) runVizRepair(brokenCode, parseError string) {
+	viz, tokens, err := repairViz(context.Background(), r.cfg.OpenAIKey, brokenCode, parseError)
+	r.reportTokenUsage(tokens)
+	if err != nil {
+		slog.Warn("viz repair failed", "room", r.id, "error", err)
+		return
+	}
+	r.persistAndBroadcastViz(viz)
+}
+
+func (r *Room) persistAndBroadcastViz(viz *VizState) {
+	if err := r.sb.UpdateRoomViz(r.id, *viz); err != nil {
+		slog.Error("failed to persist viz", "room", r.id, "error", err)
 		return
 	}
 
-	if err := r.sb.UpdateRoomGraph(r.id, *graph); err != nil {
-		slog.Error("failed to persist graph", "room", r.id, "error", err)
-		return
-	}
-
-	payload, err := json.Marshal(graph)
+	payload, err := json.Marshal(viz)
 	if err != nil {
 		return
 	}
-	out, err := json.Marshal(WSEvent{Type: "GRAPH_UPDATE", Payload: payload})
+	out, err := json.Marshal(WSEvent{Type: EventVizUpdate, Payload: payload})
 	if err != nil {
 		return
 	}
@@ -334,19 +630,26 @@ func (r *Room) sendSystem(message string) {
 	if err != nil {
 		return
 	}
-	out, err := json.Marshal(WSEvent{Type: "SYSTEM", Payload: payload})
+	out, err := json.Marshal(WSEvent{Type: EventSystem, Payload: payload})
 	if err != nil {
 		return
 	}
 	r.outgoing <- out
 }
 
-func (r *Room) sendAIChunk(generationID, chunk string, done bool) {
-	payload, err := json.Marshal(AIChunkPayload{GenerationID: generationID, Chunk: chunk, Done: done})
+func (r *Room) sendAIChunk(generationID string, agent Agent, chunk string, done bool) {
+	payload, err := json.Marshal(AIChunkPayload{
+		GenerationID: generationID,
+		AgentID:      agent.ID,
+		AgentName:    agent.Name,
+		AgentColor:   agent.Color,
+		Chunk:        chunk,
+		Done:         done,
+	})
 	if err != nil {
 		return
 	}
-	out, err := json.Marshal(WSEvent{Type: "AI_CHUNK", Payload: payload})
+	out, err := json.Marshal(WSEvent{Type: EventAIChunk, Payload: payload})
 	if err != nil {
 		return
 	}
@@ -354,7 +657,7 @@ func (r *Room) sendAIChunk(generationID, chunk string, done bool) {
 }
 
 // reportTokenUsage increments the room's persisted total and broadcasts the
-// new value. Called from triggerAI/updateGraph, so it must go through
+// new value. Called from triggerAgent/updateViz, so it must go through
 // r.outgoing rather than touching client state directly.
 func (r *Room) reportTokenUsage(tokens int64) {
 	if tokens <= 0 {
@@ -371,11 +674,55 @@ func (r *Room) reportTokenUsage(tokens int64) {
 	if err != nil {
 		return
 	}
-	out, err := json.Marshal(WSEvent{Type: "STATS", Payload: payload})
+	out, err := json.Marshal(WSEvent{Type: EventStats, Payload: payload})
 	if err != nil {
 		return
 	}
 	r.outgoing <- out
+}
+
+// broadcastPresence sends the deduplicated set of connected user ids to the
+// room. Called only from run() (which owns r.clients), so it reads the map
+// directly.
+func (r *Room) broadcastPresence() {
+	seen := make(map[string]bool, len(r.clients))
+	users := make([]string, 0, len(r.clients))
+	for c := range r.clients {
+		if !seen[c.userID] {
+			seen[c.userID] = true
+			users = append(users, c.userID)
+		}
+	}
+
+	payload, err := json.Marshal(PresencePayload{Users: users})
+	if err != nil {
+		return
+	}
+	out, err := json.Marshal(WSEvent{Type: EventPresence, Payload: payload})
+	if err != nil {
+		return
+	}
+	r.broadcastAll(out)
+}
+
+// handleTyping relays a client's typing state to everyone in the room, tagged
+// with the sender's user id. Runs on the room's run() loop (no slow work).
+func (r *Room) handleTyping(from *Client, payload json.RawMessage) {
+	var in struct {
+		IsTyping bool `json:"is_typing"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		return
+	}
+	p, err := json.Marshal(TypingPayload{UserID: from.userID, IsTyping: in.IsTyping})
+	if err != nil {
+		return
+	}
+	out, err := json.Marshal(WSEvent{Type: EventTyping, Payload: p})
+	if err != nil {
+		return
+	}
+	r.broadcastAll(out)
 }
 
 func (r *Room) broadcastAll(data []byte) {

@@ -37,6 +37,19 @@ func wsHandler(hub *Hub, cfg Config, jwks *JWKSCache) http.HandlerFunc {
 			return
 		}
 
+		// Access control: only members of the room may connect.
+		member, err := hub.sb.IsRoomMember(roomID, userID)
+		if err != nil {
+			slog.Error("ws membership check failed", "room", roomID, "error", err)
+			http.Error(w, `{"error":"membership check failed"}`, http.StatusBadGateway)
+			return
+		}
+		if !member {
+			slog.Warn("ws rejected: not a room member", "room", roomID, "user", userID)
+			http.Error(w, `{"error":"not a member of this room"}`, http.StatusForbidden)
+			return
+		}
+
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			slog.Error("websocket upgrade failed", "error", err)

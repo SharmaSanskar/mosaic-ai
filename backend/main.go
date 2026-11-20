@@ -23,14 +23,22 @@ func main() {
 	r.Use(structuredLogger)
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{cfg.CORSOrigin},
-		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Content-Type", "Authorization"},
 		AllowCredentials: true,
 	}))
 
 	r.Get("/health", healthHandler)
-	r.Get("/api/rooms", roomsHandler(sb))
 	r.Get("/ws", wsHandler(hub, cfg, jwks))
+
+	// Authenticated REST.
+	r.Group(func(pr chi.Router) {
+		pr.Use(authMiddleware(cfg, jwks))
+		pr.Get("/api/rooms", roomsHandler(sb))
+		pr.Post("/api/keys", createKeyHandler(sb, cfg))
+		pr.Get("/api/keys", listKeysHandler(sb))
+		pr.Delete("/api/keys/{id}", deleteKeyHandler(sb))
+	})
 
 	slog.Info("Mosaic backend starting", "port", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, r); err != nil {
